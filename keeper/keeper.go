@@ -31,5 +31,6 @@ func (k *Keeper) Run() {
 		}
 	}
 
+	k.CertManager.CleanCasDuplicateCertificate()
 	k.CertManager.CleanCasExpiredCertificate()
 }

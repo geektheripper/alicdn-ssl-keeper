@@ -1,8 +1,6 @@
 package cert_helper
 
 import (
-	"crypto/x509"
-	"encoding/pem"
 	"log"
 	"strings"
 	"time"
@@ -17,6 +15,7 @@ import (
 	util "github.com/alibabacloud-go/tea-utils/v2/service"
 	"github.com/alibabacloud-go/tea/tea"
 	"github.com/geektheripper/alicdn-ssl-keeper/keeper/storage"
+	"github.com/geektheripper/alicdn-ssl-keeper/utils"
 )
 
 type CertManager struct {
@@ -64,8 +63,7 @@ func (m *CertManager) GetCertificateFromStorage(commonName string) (*Certificate
 	}
 
 	if cert.Certificate != nil {
-		block, _ := pem.Decode(cert.Certificate)
-		x509Cert, err := x509.ParseCertificate(block.Bytes)
+		x509Cert, err := utils.ParseCertificate(cert.Certificate)
 		if err != nil {
 			return nil, err
 		}
@@ -78,12 +76,15 @@ func (m *CertManager) GetCertificateFromStorage(commonName string) (*Certificate
 	request := certificate.ObtainRequest{Domains: []string{commonName}}
 
 	if cert.PrivateKey != nil {
-		request.PrivateKey = cert.PrivateKey
+		request.PrivateKey, err = utils.ParseRSAKey(cert.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	certRes, err := m.lego.Certificate.Obtain(request)
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 
 	cert.PrivateKey = certRes.PrivateKey
@@ -120,13 +121,26 @@ func (m *CertManager) SearchAvailableCertificateFromCas(commonName string) (*Cer
 
 	for _, certOrder := range resp.Body.CertificateOrderList {
 		domains := strings.Split(*certOrder.Sans, ",")
-		if lo.Contains(domains, commonName) {
-			cert := &Certificate{
+		if !lo.Contains(domains, commonName) {
+			continue
+		}
+
+		certDetailResp, err := m.cas.GetUserCertificateDetail(&cas.GetUserCertificateDetailRequest{CertId: certOrder.CertificateId})
+		if err != nil {
+			return nil, err
+		}
+
+		cert, err := utils.ParseCertificate([]byte(*certDetailResp.Body.Cert))
+		if err != nil {
+			return nil, err
+		}
+
+		if int(cert.NotAfter.Sub(time.Now()).Hours()/24) > 7 {
+			return &Certificate{
 				CommonName:       commonName,
 				CasCertificateId: *certOrder.CertificateId,
 				casName:          *certOrder.Name,
-			}
-			return cert, nil
+			}, nil
 		}
 	}
 
@@ -178,6 +192,14 @@ func (m *CertManager) GetCertificate(commonName string) (*Certificate, error) {
 	return cert, nil
 }
 
+func (m *CertManager) tryLogAndDeleteCertificate(cert *cas.ListUserCertificateOrderResponseBodyCertificateOrderList, reason string) {
+	log.Printf("delete certificate %s (%d): %s", *cert.Name, *cert.CertificateId, reason)
+	_, err := m.cas.DeleteUserCertificate(&cas.DeleteUserCertificateRequest{CertId: cert.CertificateId})
+	if err != nil {
+		log.Printf("delete certificate %d failed: %v", *cert.CertificateId, err)
+	}
+}
+
 func (m *CertManager) CleanCasExpiredCertificate() {
 	resp, err := m.cas.ListUserCertificateOrderWithOptions(&cas.ListUserCertificateOrderRequest{
 		OrderType: tea.String("UPLOAD"),
@@ -193,10 +215,58 @@ func (m *CertManager) CleanCasExpiredCertificate() {
 			continue
 		}
 
-		m.cas.DeleteUserCertificate(&cas.DeleteUserCertificateRequest{
-			CertId: tea.Int64(*certOrder.CertificateId),
-		})
+		m.tryLogAndDeleteCertificate(certOrder, "expired")
+	}
+}
 
-		log.Printf("delete expired certificate %s (%s)", *certOrder.Name, *certOrder.Sans)
+func (m *CertManager) CleanCasDuplicateCertificate() {
+	resp, err := m.cas.ListUserCertificateOrderWithOptions(&cas.ListUserCertificateOrderRequest{
+		OrderType: tea.String("UPLOAD"),
+	}, &util.RuntimeOptions{})
+
+	if err != nil {
+		return
+	}
+
+	type CertInfo struct {
+		Cert *cas.ListUserCertificateOrderResponseBodyCertificateOrderList
+		Exp  int64
+	}
+
+	certMap := make(map[string]*CertInfo)
+
+	for _, certOrder := range resp.Body.CertificateOrderList {
+		if !strings.HasPrefix(*certOrder.Name, "sslkeeper-") {
+			continue
+		}
+
+		certResp, err := m.cas.GetUserCertificateDetail(&cas.GetUserCertificateDetailRequest{CertId: certOrder.CertificateId})
+		if err != nil {
+			log.Printf("get certificate detail for %d failed: %v", *certOrder.CertificateId, err)
+			continue
+		}
+
+		cert, err := utils.ParseCertificate([]byte(*certResp.Body.Cert))
+		if err != nil {
+			log.Printf("parse certificate for %d failed: %v", *certOrder.CertificateId, err)
+			continue
+		}
+
+		current := &CertInfo{
+			Cert: certOrder,
+			Exp:  cert.NotAfter.Unix(),
+		}
+
+		if _, ok := certMap[*certOrder.CommonName]; !ok {
+			certMap[*certOrder.CommonName] = current
+		} else {
+			recorded := certMap[*certOrder.CommonName]
+			if current.Exp < recorded.Exp {
+				m.tryLogAndDeleteCertificate(current.Cert, "duplicated")
+			} else {
+				m.tryLogAndDeleteCertificate(recorded.Cert, "duplicated")
+				certMap[*certOrder.CommonName] = current
+			}
+		}
 	}
 }

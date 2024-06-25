@@ -2,8 +2,6 @@ package cert_helper
 
 import (
 	"crypto/x509"
-	"encoding/pem"
-	"log"
 	"strings"
 
 	"github.com/geektheripper/alicdn-ssl-keeper/utils"
@@ -27,11 +25,9 @@ func (c *Certificate) X509Certificate() *x509.Certificate {
 	if c.x509Cert != nil {
 		return c.x509Cert
 	}
-	block, _ := pem.Decode(c.Certificate)
-	x509Cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		log.Fatalf("parse cert failed for %s: %v", c.CommonName, err)
-	}
+
+	x509Cert, _ := utils.ParseCertificate(c.Certificate)
+
 	c.x509Cert = x509Cert
 	return c.x509Cert
 }
